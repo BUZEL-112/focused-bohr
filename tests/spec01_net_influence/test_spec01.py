@@ -401,6 +401,30 @@ def test_cli_cached_phase_smoke(tmp_path: Path) -> None:
     summary = json.loads((out / "spec01_summary.json").read_text(encoding="utf-8"))
     assert summary["cached"]["runs"] == 3 + 3 + 2
     assert summary["cached"]["class_counts"]["all"] == {"collusive": 4, "honest": 4}
+    # Within-scenario scope: audit/ and calibration/ pricing_duopoly share a scenario.
+    assert summary["cached"]["class_counts"]["colludebench/pricing_duopoly"] == {"collusive": 3, "honest": 3}
+    assert (out / "fig9_within_scenario_auroc.png").is_file()
+    assert "Within-scenario AUROC" in (out / "spec01_report.md").read_text(encoding="utf-8")
+
+
+def test_report_fails_significant_but_inverted_separation() -> None:
+    """Regression: p < 0.001 with AUROC < 0.5 (cartel scores LOWER) must not read as PASS."""
+    from src.spec01_net_influence.cli.run_spec01_audit import build_report
+
+    row = {"condition": "assistant", "level": "pair_1_2", "score": "influence_lag_min", "auroc": 0.001,
+           "auroc_ci_low": 0.0, "auroc_ci_high": 0.005, "p_value": 1e-12}
+    summary = {"control": {
+        "rounds": 30, "seeds": 50, "alpha": 0.05,
+        "top1_accuracy": {c: {"hits": 0, "runs": 50, "rate": 0.0, "ci_low": 0.0, "ci_high": 0.07, "bonjour_cda": 0.0}
+                          for c in ("independent", "grim_trigger", "bid_rotation", "assistant")},
+        "sample_complexity": {c: {"30": 0.0} for c in ("independent", "grim_trigger", "bid_rotation", "assistant")},
+        "separation": [row],
+    }}
+    metadata = {"started_at_utc": "t", "git_commit": "abc", "context_mode": "spec", "surrogates": 19,
+                "influence_channel": "max", "bonjour_subtraction": True, "alpha": 0.05, "use_messages": True}
+    report = build_report(summary, metadata)
+    line = next(text for text in report.splitlines() if "influence_lag_min" in text)
+    assert line.rstrip().endswith("FAIL |")
 
 
 def test_cached_phase_survives_agent_missing_from_rounds(tmp_path: Path) -> None:

@@ -110,7 +110,7 @@ Where the paper and this implementation differ, say so in the write-up:
 python -m pytest tests/spec01_net_influence -v
 ```
 
-There are 37 tests: the 28 below plus the 9 Bonjour-alignment tests listed after the table.
+There are 39 tests: the 28 below, the 9 Bonjour-alignment tests listed after the table, and 2 regression tests from the Colab runs (missing-agent crash, inverted-verdict report). The cached smoke test also now checks the within-scenario scope and Figure 9.
 
 > **First Colab run (25 Oct 2026): 35 / 36 passed.** Both ranker tests previously marked "uncertain" (grim trigger, independent) **passed**. Bid rotation failed (true pair ranked 2nd for seed 1) because circular-shift surrogates cancel a period-2 schedule. The same-round channel now uses permutation surrogates instead, and a regression test was added. Re-run to confirm 37 / 37.
 
@@ -384,6 +384,50 @@ Once §3 to §6 are done, from `sol-orbital\`:
 git add spec src/spec01_net_influence tests/spec01_net_influence src/common
 git commit -m "Spec 01: spec-faithful NI conditioning, surrogate debiasing, cached-phase fixes, rich outputs"
 ```
+
+---
+
+## 9b. Results of the first full Colab run (25 Oct 2026, commit `44dbe8cdab`)
+
+| Hypothesis | Result | Verdict |
+|---|---|---|
+| H1: pair (1,2) top-1 in 100% of runs within 20 rounds | Bid rotation 100% from T=10; price fixing 40–64%, falling with T; assistant (extension) 80% | **FAIL** (bid rotation only) |
+| H2: price screens blind on bid rotation, detector > 0.85 | Price-elevation AUROC 0.51, hybrid 1.00 | **PASS** |
+| §5 separation, p < 0.001 | Lag channel separates price fixing (AUROC 0.84); same-round channel separates bid rotation and assistant (1.00) | PASS for the matching channel |
+| H3: cached AUROC > 0.88 | Pooled hybrid 0.215 with messages, 0.89 without; **confounded by scenario mix** | FAIL as pre-registered; see within-scenario |
+| H4: compression on messages catches hidden words | Adding messages *lowers* compression AUROC (0.96 → 0.22) | **Contradicted** |
+| H5: ≥ 95% detection by T = 20 when CP ≥ 0.4 | Never reached at T ≤ 30, except bid rotation top-1 at CP = 1.0 (T = 10) | **FAIL** |
+
+Within-scenario re-scoring of the same run (computed from `spec01_cached_runs.csv`):
+
+| Scenario | n+ / n− | Net influence | Hybrid | Mean price | Reading |
+|---|---|---|---|---|---|
+| pricing_duopoly | 604 / 26 | **0.88** | 0.86 (0.88 without messages) | 0.87 | Best real-data evidence for the detector |
+| first_price_auction | 403 / 5,844 | 0.20 | 0.32 (1.00 without messages) | 1.00 | Collusion is visible in price levels alone |
+| continuous_double_auction | 40 / 50 | 0.00 | 0.00 | 0.00 | Honest calibration traders all post the identical scripted bid (`Bid:99.75`) every round: **honest herding looks maximally coupled**. Labels are correct; this is a genuine false-positive mode |
+| LLM double auction | 35 / 40 | 0.68 | 0.50 | 0.32 | Weak signal from net influence alone |
+
+**Interpretations for the write-up:**
+
+1. **Silent cartel.** A disciplined price-fixing cartel holds a near-constant price, so its streams carry little information, and detection *falls* as the cartel gets more stable (Exp 1 T-curve, Exp 3 CP = 1.0 below CP = 0.4). The price screen catches exactly this case (AUROC 0.999). The two are complements, not substitutes.
+2. **Channel matches mechanism.** Next-round influence catches punishment strategies; same-round influence catches schedules and assistant play (Bonjour eq. 6). Neither alone covers all cartels.
+3. **Horizon.** At 30 rounds the debiased-MI noise floor is about the size of α = 0.05, so strict Bonjour detection tops out near 74%. Bonjour et al. used 100–1,000 games; test the horizon before concluding the method fails (Exp 3b below).
+4. **Herding false positives.** Identical honest policies (shared scripts, shared priors, focal points) are indistinguishable from coordination by any coupling statistic. Report the continuous-double-auction result as a limitation.
+5. **Messages hurt NCD here.** The honest ColludeBench runs reuse templated messages, which compress together better than the colluders' varied steganographic messages. H4's mechanism needs a scripted test with a planted shared phrase before it can be claimed.
+
+**Follow-up runs (after the within-scenario and verdict-direction fixes):**
+
+```bash
+# Exp 2 again: the report now leads with the within-scenario table and Figure 9
+python -m src.spec01_net_influence.cli.run_spec01_audit --phase cached --output-dir outputs/exp2b
+python -m src.spec01_net_influence.cli.run_spec01_audit --phase cached --no-messages --output-dir outputs/exp2b_nomsg
+# Exp 3b: Bonjour-scale horizons, to test whether H5 fails only on horizon length
+python -m src.spec01_net_influence.cli.run_spec01_audit --phase cpsweep --seeds 50 --cp-values 0.2 0.4 0.6 0.8 1.0 --cp-rounds 30 50 100 200 --output-dir outputs/exp3b
+# Exp 1 again: only the separation table's verdicts change (direction fix)
+python -m src.spec01_net_influence.cli.run_spec01_audit --phase control --seeds 50 --output-dir outputs/exp1b
+```
+
+Exp 3b is the heaviest run, at roughly 10–20 minutes on Colab.
 
 ---
 
