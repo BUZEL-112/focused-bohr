@@ -25,6 +25,12 @@ Work through the sections in order. Each step says what to run, what you should 
 | Claim 3, Xu regime (price screens blind, detector not) | Implemented on scripted bid rotation (Fig 5) | same |
 | Phase 2: cached-log audit (ColludeBench + double auction), Fig 2 | Implemented, with per-source and per-group breakdowns | `cli/run_spec01_audit.py --phase cached` |
 | Bootstrap AUROC CIs, Wilson CIs, auto-generated report | Implemented | `services/audit_statistics_service.py`, `spec01_report.md` |
+| **Bonjour et al. (2022) alignment** (paper in `src/`) | Implemented — see §2b | `services/coalition_ranker_service.py`, `services/net_influence_service.py` |
+| Bonjour eq. 4–5: Γ(i;j) = γ(i;j) − max_k γ(k;j), flag if both directions ≥ α | Implemented (default on; `--no-bonjour-subtraction` to ablate) | ranker |
+| Bonjour eq. 6: same-round influence I(z_i,t ; z_j,t \| S_t) | Implemented alongside lag-1; `--influence-channel lag\|simultaneous\|max` | net influence service |
+| Market-level score (all-agent cartels, which eq. 4 would cancel) | Implemented (`market_influence`) | `models.py` |
+| Collusion-probability sweep: CDA vs rounds, swiftness (Bonjour Figs 2–3, Table 2) | Implemented (`--phase cpsweep`) | CLI |
+| Condition D: assistant collusion (Bonjour §5.1) | Implemented | `repositories/trajectory_repository.py` |
 | Phase 3: live 4-seller double auction with a seeded 2-seller cartel | **Not implemented** | — |
 | Table 1: FPR on `focal-points`, cost per 1,000 rounds | **Not implemented** | — |
 | LLM-judge comparison (spec claim 4) | **Not implemented** | — |
@@ -77,6 +83,25 @@ Add `outputs/` to `sol-orbital\.gitignore` so run outputs are not committed by a
 
 **Every cached-phase result produced before this pass is invalid** (items 7, 8 and 10).
 
+## 2b. Alignment with Bonjour et al. (2022)
+
+Checked against the paper in `src/Information-Theoretic Approach to Detect Collusion in Multi-Agent Games.pdf` (UAI 2022, PMLR 180:223–232).
+
+| Paper | What the code now does | Where it shows up |
+|---|---|---|
+| **Eq. 4** Γ(i;j) = γ(i;j) − max_{k≠i,j} γ(k;j) | Applied per channel; a pair's net influence is min(Γ(i;j), Γ(j;i)). With two agents there is no third party, so Γ = γ. The third-party term is floored at 0 because debiased γ can be slightly negative. | `net_influence_lag`, `net_influence_simultaneous` columns |
+| **Eq. 5** collusion if Γ(i;j) and Γ(j;i) ≥ α; α = 0.05 | `--alpha 0.05`. **Bonjour CDA** = share of seeds where *exactly one* pair is flagged and it is the planted pair (paper §4) | `bonjour_detected_true_pair`, `bonjour_cda` |
+| **Eq. 6** same-round γ for simultaneous games | `influence_simultaneous`: I(z_i,t ; z_j,t \| mean of the others), surrogate-debiased. Catches "chat, then price in the same round", which lag-1 cannot see. | `influence_simultaneous`; ranking channel `max` by default |
+| Spec 01 eq. 4.2 (lag-1 directed information) | Kept as the second channel | `influence_lag_min`, `directed_info_*` |
+| §7: method limited to **exactly two** colluders | `market_influence` = mean over pairs of the stronger channel, *without* subtraction, so an all-seller cartel does not cancel itself | `market_influence` (control runs, cached runs, CP sweep) |
+| §5.1 **CP sweep**, Figs 2–3, Table 2; swiftness (Smed et al. 2007) | CP ∈ {0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0} × T ∈ {10, 20, 30, 50, 100} for conditions B, C and D | Figs 7–8, `spec01_cp_sweep_*.csv` |
+| §5.1 **assistant collusion** | Condition D: agent 2 always posts one level above agent 1 in the same round | All control outputs; reported as an extension, with no spec target |
+| §5.2 **low-payoff (LP) collusion**, Table 3 rows D1/D2 (Γ ≈ 0.68 at ≈ zero payoff) | Not reproduced (it is poker with trained agents). Cite it in the write-up next to Xu et al. (2026a) as the payoff-blind precedent for claim 3. | — |
+
+Where the paper and this implementation differ, say so in the write-up:
+- The paper estimates γ on raw actions with plug-in MI over up to 1,000 games. Here γ is estimated on **market-residualized** symbols with Miller-Madow plus surrogate debiasing, because the runs are 30 rounds, not 1,000 games.
+- The paper's state S is the game state. Here the conditioning is the residualized market context (own past plus the mean of the other agents), because residualization has already removed the public demand shock.
+
 ---
 
 ## 3. Unit tests (first real check)
@@ -85,7 +110,7 @@ Add `outputs/` to `sol-orbital\.gitignore` so run outputs are not committed by a
 python -m pytest tests/spec01_net_influence -v
 ```
 
-There are 28 tests.
+There are 36 tests: the 28 below plus the 8 Bonjour-alignment tests listed after the table.
 
 | Test | Expected | What it proves |
 |---|---|---|
@@ -117,6 +142,20 @@ There are 28 tests.
 | `test_cli_control_phase_smoke` | pass | The whole control phase runs end to end and writes every file |
 | `test_cli_cached_phase_smoke` | pass | The cached phase runs on a tiny fake `collusion_hackathon` and writes every file |
 | `test_rebenchmark_breaks_duopoly_mirroring` | pass | The honest-population benchmark removes the duopoly mirror |
+
+Bonjour-alignment tests (all expected to pass; each one is deterministic or has a wide margin):
+
+| Test | What it proves |
+|---|---|
+| `test_simultaneous_influence_detects_same_round_copy` | Same-round channel > 0.5 bits on a same-round copy, while lag-1 stays < 0.1 |
+| `test_bonjour_subtraction_never_exceeds_individual_influence` | Γ ≤ γ with subtraction on; Γ = γ with it off |
+| `test_influence_channel_validated` | A bad `--influence-channel` is rejected |
+| `test_flagged_pairs_market_influence_and_bonjour_rule` | Eq. 5 flagging, the "exactly one pair" rule, and the `market_influence` maths |
+| `test_collusion_probability_one_matches_default` | CP = 1 reproduces the original runs exactly |
+| `test_collusion_probability_zero_leaves_colluders_honest` | CP = 0 removes the cartel rule; CP outside [0, 1] is rejected |
+| `test_assistant_condition_never_undercuts_primary` | Condition D follows its definition every round |
+| `test_cli_cp_sweep_smoke` | `--phase cpsweep` runs end to end and writes every file |
+| `test_cli_control_phase_smoke` (updated) | Now covers all 4 conditions |
 
 If any test **other than the two "uncertain" rows** fails, stop and send Claude the full failure output; one of the changes in §2 is wrong. The two smoke tests matter most: if they pass, the full runs in §5 and §6 will not crash.
 
@@ -166,7 +205,7 @@ print("MI(a;b|d)  ", conditional_mutual_information(a, b, d, bias_correction=Tru
 python -m src.spec01_net_influence.cli.run_spec01_audit --phase control --seeds 50 --output-dir outputs/spec01_control
 ```
 
-50 seeds gives tight confidence intervals; it should take a minute or two. The console prints one top-1 line per condition. Independent is the **placebo**: the rate at which an innocent pair (1,2) is ranked top-1 by chance, about 1/6.
+50 seeds gives tight confidence intervals; it should take a few minutes. The console prints one line per condition with the top-1 rate and the **Bonjour CDA**. Condition A (independent) is the **placebo**: an innocent pair (1,2) should be top-1 about 1/6 of the time and should almost never be flagged by Bonjour's rule. Condition D (assistant collusion) is an extension from the paper and has no spec target.
 
 ### 5.2 Ablation runs (the comparison for your write-up)
 
@@ -180,6 +219,18 @@ python -m src.spec01_net_influence.cli.run_spec01_audit --phase control --seeds 
 ```
 
 The three-way comparison shows how much each estimator change contributes: old vs spec context vs spec + surrogates.
+
+Bonjour ablations (same command, different folders):
+
+```powershell
+# Lag-1 only (the spec's original channel) vs same-round only
+python -m src.spec01_net_influence.cli.run_spec01_audit --phase control --seeds 50 --influence-channel lag --output-dir outputs/spec01_control_lag
+python -m src.spec01_net_influence.cli.run_spec01_audit --phase control --seeds 50 --influence-channel simultaneous --output-dir outputs/spec01_control_sim
+# Without Bonjour eq. 4 subtraction
+python -m src.spec01_net_influence.cli.run_spec01_audit --phase control --seeds 50 --no-bonjour-subtraction --output-dir outputs/spec01_control_nosub
+```
+
+What to expect from the design (not yet measured): grim trigger acts across rounds, so it should show on the **lag** channel. Bid rotation and assistant collusion act within a round, so they should show on the **same-round** channel. The default `max` should catch all three. If it does, that is a clean result for the write-up.
 
 ### 5.3 Files and what to extract
 
@@ -205,7 +256,25 @@ The three-way comparison shows how much each estimator change contributes: old v
 | §5 separation | p < 0.001 for B-vs-A and C-vs-A on NI, CCS and hybrid |
 | 3 (Xu regime) | Bid rotation vs independent: price-elevation AUROC in 0.40–0.60 (blind) **and** hybrid AUROC > 0.85 |
 
-If claim 1 falls short, use `spec01_control_runs.csv` to see which score fails. Compare `true_pair_net_influence` with `true_pair_compression_coupling`, and look at `hybrid_margin` (negative = a different pair won).
+If claim 1 falls short, use `spec01_control_runs.csv` to see which score fails. Compare `true_pair_net_influence_lag`, `true_pair_net_influence_simultaneous` and `true_pair_compression_coupling`, and look at `hybrid_margin` (negative = a different pair won). Other useful columns there: `bonjour_flagged_pairs` (how many pairs cross α) and `market_influence`.
+
+### 5.5 Collusion-probability sweep (Bonjour Figs 2–3, Table 2)
+
+```powershell
+python -m src.spec01_net_influence.cli.run_spec01_audit --phase cpsweep --seeds 50 --output-dir outputs/spec01_cpsweep
+```
+
+This covers 3 cartel conditions × 7 CP values × 50 seeds × 5 horizons (10, 20, 30, 50, 100 rounds). Expect several minutes. Change the grid with `--cp-values 0.1 0.3 1.0` and `--cp-rounds 20 50 100 200`.
+
+| File | One row per | Use it for |
+|---|---|---|
+| `spec01_cp_sweep_runs.csv` | condition × CP × seed × T | Planted-pair Γ (both channels), strongest and mean other-pair Γ, Bonjour detection, top-1, market influence |
+| `spec01_cp_sweep_cda.csv` | condition × CP × T | **CDA with Wilson CI** (your equivalent of Bonjour Table 2), top-1 rate, mean planted vs strongest-other Γ |
+| `spec01_cp_sweep_swiftness.csv` | condition × CP | Fewest rounds to 95% CDA (blank = not reached within the tested horizons) |
+| `fig7_cda_vs_rounds.png` | — | CDA vs T, one line per CP, one panel per condition (cf. Bonjour Fig 2) |
+| `fig8_net_influence_vs_cp.png` | — | Planted-pair Γ vs CP against the strongest other pair and α (cf. Bonjour Fig 3) |
+
+What the paper found, so you know what pattern to expect: CDA rises with both CP and T; at low CP (0.1) the paper cannot detect collusion at α = 0.05 even with 1,000 games. Comparable behaviour here supports the method; a large difference is itself a finding worth reporting.
 
 ---
 
@@ -261,7 +330,12 @@ python -m src.spec01_net_influence.cli.run_spec01_audit --seeds 50 --output-dir 
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--phase` | `all` | `control`, `cached` or `all` |
+| `--phase` | `all` | `control`, `cpsweep`, `cached` or `all` |
+| `--influence-channel` | `max` | `lag` (spec eq. 4.2), `simultaneous` (Bonjour eq. 6) or `max` of both |
+| `--no-bonjour-subtraction` | off | Skip Bonjour eq. 4 (Γ = γ) |
+| `--alpha` | 0.05 | Bonjour collusion threshold |
+| `--cp-values` | 0.1 0.2 0.3 0.4 0.6 0.8 1.0 | CP sweep grid |
+| `--cp-rounds` | 10 20 30 50 100 | CP sweep horizons |
 | `--seeds` | 20 | Scripted runs per condition |
 | `--rounds` | 30 | Rounds per scripted run (the sample-complexity horizons below this are added automatically) |
 | `--context-mode` | `spec` | `spec` or `compound` (old) |
@@ -313,7 +387,7 @@ git commit -m "Spec 01: spec-faithful NI conditioning, surrogate debiasing, cach
 
 | Step | Check | Date | Result | Notes |
 |---|---|---|---|---|
-| §3 | `pytest tests/spec01_net_influence -v` | | __ / 28 passed | failures: |
+| §3 | `pytest tests/spec01_net_influence -v` | | __ / 36 passed | failures: |
 | §3 | ranker grim_trigger test | | pass / fail | |
 | §3 | ranker independent test | | pass / fail | |
 | §4 | (a) corrected < plug-in · (c) MI vs CMI | | | |
@@ -322,7 +396,13 @@ git commit -m "Spec 01: spec-faithful NI conditioning, surrogate debiasing, cach
 | §5.1 | separation p < 0.001 (NI, CCS, hybrid) | | | |
 | §5.1 | Xu regime: price-elevation vs hybrid AUROC | | | target ≈0.5 vs > 0.85 |
 | §5.2 | old / spec-no-surr / spec+surr top-1 (B) | | | |
+| §5.1 | Bonjour CDA: A (should be ~0) / B / C / D | | | |
+| §5.2 | channel ablation top-1 (lag / sim / max) for B, C, D | | | |
+| §5.2 | with vs without Bonjour subtraction | | | |
+| §5.5 | swiftness at CP = 1.0 / 0.4 / 0.2 (B, C, D) | | | |
+| §5.5 | lowest CP reaching 95% CDA by T = 100 | | | |
 | §6.1 | runs scored; class counts | | | |
+| §6.1 | `market_influence` AUROC (double auction, all-seller chat) | | | |
 | §6.1 | hybrid AUROC: all / colludebench / double_auction | | | target > 0.88 |
 | §6.1 | price screens AUROC (price_elevation, mean_price, naive) | | | |
 | §6.1 | `--no-messages` hybrid AUROC | | | |

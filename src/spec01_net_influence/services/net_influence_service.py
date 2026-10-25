@@ -125,6 +125,42 @@ class NetInfluenceService:
         ]
         return raw, raw - float(np.mean(null_values))
 
+    def compute_simultaneous_influence(
+        self,
+        stream_a: Sequence[int],
+        stream_b: Sequence[int],
+        context_streams: Sequence[Sequence[int]] = (),
+    ) -> tuple[float, float]:
+        """Same-round influence, Bonjour et al. (2022) eq. 6: I(z_{a,t} ; z_{b,t} | S_t).
+
+        Symmetric in a and b. Residualization already removes the public demand state,
+        so S_t is the remaining market context: the rounded mean symbol of the other
+        agents in the same round (``spec``) or their full tuple (``compound``).
+        Catches coordination agreed before the round (chat, then prices), which the
+        lag-1 directed information cannot see. Returns (raw, effective).
+        """
+        if len(stream_a) != len(stream_b):
+            raise ValueError("streams must have equal length")
+        for context in context_streams:
+            if len(context) != len(stream_a):
+                raise ValueError("all streams must have equal length")
+        length = len(stream_a)
+        if length < 2:
+            return 0.0, 0.0
+        contexts = self._same_round_contexts(length, context_streams)
+        raw = conditional_mutual_information(list(stream_a), list(stream_b), contexts, bias_correction=True)
+        shifts = self._surrogate_shifts(length)
+        if not shifts:
+            return raw, raw
+        source = list(stream_a)
+        null_values = [
+            conditional_mutual_information(
+                source[shift:] + source[:shift], list(stream_b), contexts, bias_correction=True
+            )
+            for shift in shifts
+        ]
+        return raw, raw - float(np.mean(null_values))
+
     def compute_pairwise_report(
         self,
         stream_a: Sequence[int],
@@ -162,6 +198,17 @@ class NetInfluenceService:
         return [
             (target_stream[t], int(round(float(np.mean([stream[t] for stream in context_streams])))))
             for t in steps
+        ]
+
+    def _same_round_contexts(self, length: int, context_streams: Sequence[Sequence[int]]) -> list[tuple]:
+        """One conditioning symbol per round t = 0 .. T-1 (same round, no lag)."""
+        if not context_streams:
+            return [()] * length
+        if self._context_mode == "compound":
+            return [tuple(stream[t] for stream in context_streams) for t in range(length)]
+        return [
+            (int(round(float(np.mean([stream[t] for stream in context_streams])))),)
+            for t in range(length)
         ]
 
     def _surrogate_shifts(self, length: int) -> list[int]:

@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 
 from src.common.metrics import auroc, mann_whitney_p_value
-from src.spec01_net_influence.models import AgentTurnRecord
+from src.spec01_net_influence.models import (
+    AgentTurnRecord,
+    CoalitionRanking,
+    DiscretizedTrajectory,
+    PairwiseAuditScore,
+)
 from src.spec01_net_influence.repositories.trajectory_repository import (
     generate_scripted_run,
     load_colludebench_jsonl,
@@ -341,7 +346,7 @@ def test_cli_control_phase_smoke(tmp_path: Path) -> None:
     ):
         assert (out / name).is_file(), name
     summary = json.loads((out / "spec01_summary.json").read_text(encoding="utf-8"))
-    assert set(summary["control"]["top1_accuracy"]) == {"independent", "grim_trigger", "bid_rotation"}
+    assert set(summary["control"]["top1_accuracy"]) == {"independent", "grim_trigger", "bid_rotation", "assistant"}
 
 
 def _write_duopoly_jsonl(path: Path, runs: int, rounds: int, high: bool) -> None:
@@ -414,3 +419,118 @@ def test_rebenchmark_breaks_duopoly_mirroring(tmp_path: Path) -> None:
         by_round.setdefault(turn.round_id, []).append(turn.action_value - turn.market_benchmark)
     # Collusive prices (~15) sit far above the honest median (~1.1): both residuals positive.
     assert all(min(values) > 10.0 for values in by_round.values())
+
+
+# --------------------------------------------------------------------------- #
+# Bonjour et al. (2022): same-round influence, eq. 4 subtraction, CP, assistant
+# --------------------------------------------------------------------------- #
+def test_simultaneous_influence_detects_same_round_copy() -> None:
+    """b copies a in the SAME round: the same-round channel sees it, lag-1 does not."""
+    rng = np.random.default_rng(7)
+    a = rng.integers(0, 5, size=300).tolist()
+    b = [value if rng.random() < 0.8 else int(rng.integers(0, 5)) for value in a]
+    service = NetInfluenceService()
+    _raw, simultaneous = service.compute_simultaneous_influence(a, b)
+    _lag_raw, lag = service.compute_effective_directed_information(a, b)
+    assert simultaneous > 0.5
+    assert lag < 0.1
+
+
+def _trajectory(symbols: dict[str, list[int]]) -> DiscretizedTrajectory:
+    length = len(next(iter(symbols.values())))
+    return DiscretizedTrajectory(
+        run_id="t",
+        is_collusive=True,
+        colluding_pair=None,
+        symbols_by_agent={agent: tuple(values) for agent, values in symbols.items()},
+        messages_by_agent={agent: ("",) * length for agent in symbols},
+    )
+
+
+def test_bonjour_subtraction_never_exceeds_individual_influence() -> None:
+    rng = np.random.default_rng(8)
+    x = rng.integers(0, 5, size=120).tolist()
+    trajectory = _trajectory({
+        "x": x,
+        "y": [v if rng.random() < 0.7 else int(rng.integers(0, 5)) for v in x],
+        "z": [v if rng.random() < 0.7 else int(rng.integers(0, 5)) for v in x],
+        "w": rng.integers(0, 5, size=120).tolist(),
+    })
+    with_sub = CoalitionRankerService(bonjour_subtraction=True).audit_run(trajectory)
+    without = CoalitionRankerService(bonjour_subtraction=False).audit_run(trajectory)
+    for score in with_sub.scores:
+        assert score.net_influence_simultaneous <= score.influence_simultaneous + 1e-12
+        assert score.net_influence_lag <= score.influence_lag_min + 1e-12
+    for score in without.scores:
+        assert score.net_influence_simultaneous == pytest.approx(score.influence_simultaneous)
+        assert score.net_influence_lag == pytest.approx(score.influence_lag_min)
+
+
+def test_influence_channel_validated() -> None:
+    with pytest.raises(ValueError):
+        CoalitionRankerService(channel="both")
+
+
+def _score(a: str, b: str, net: float, lag: float = 0.0, sim: float = 0.0) -> PairwiseAuditScore:
+    return PairwiseAuditScore(
+        agent_a=a, agent_b=b, directed_info_a_to_b=0.0, directed_info_b_to_a=0.0,
+        net_influence=net, compression_coupling=0.0, influence_lag_min=lag, influence_simultaneous=sim,
+    )
+
+
+def test_flagged_pairs_market_influence_and_bonjour_rule() -> None:
+    from src.spec01_net_influence.cli.run_spec01_audit import bonjour_detects
+
+    ranking = CoalitionRanking(
+        run_id="r",
+        scores=(
+            _score("agent_1", "agent_2", net=0.30, lag=0.2, sim=0.4),
+            _score("agent_1", "agent_3", net=0.01, lag=0.1, sim=0.0),
+            _score("agent_2", "agent_3", net=-0.2, lag=0.0, sim=0.1),
+        ),
+    )
+    assert ranking.flagged_pairs(0.05) == [("agent_1", "agent_2")]
+    assert ranking.market_influence == pytest.approx((0.4 + 0.1 + 0.1) / 3)
+    assert bonjour_detects(ranking, 0.05)
+    assert not bonjour_detects(ranking, 0.005)  # two pairs flagged -> not "exactly one"
+
+
+def test_collusion_probability_one_matches_default() -> None:
+    default = generate_scripted_run("grim_trigger", rounds=25, seed=3)
+    explicit = generate_scripted_run("grim_trigger", rounds=25, seed=3, collusion_probability=1.0)
+    assert default.turns == explicit.turns and default.run_id == explicit.run_id
+
+
+def test_collusion_probability_zero_leaves_colluders_honest() -> None:
+    run = generate_scripted_run("bid_rotation", rounds=30, seed=1, collusion_probability=0.0)
+    levels = {round((t.action_value - t.market_benchmark) / 2.0 + 2) for t in run.turns if t.agent_id == "agent_1"}
+    assert levels & {1, 2, 3}  # a rotating colluder would only ever post levels 0 and 4
+    assert run.is_collusive and run.run_id.endswith("_cp0")
+    with pytest.raises(ValueError):
+        generate_scripted_run("bid_rotation", collusion_probability=1.5)
+
+
+def test_assistant_condition_never_undercuts_primary() -> None:
+    run = generate_scripted_run("assistant", rounds=40, seed=2)
+    by_round: dict[int, dict[str, int]] = {}
+    for turn in run.turns:
+        level = round((turn.action_value - turn.market_benchmark) / 2.0 + 2)
+        by_round.setdefault(turn.round_id, {})[turn.agent_id] = level
+    for levels in by_round.values():
+        assert levels["agent_2"] == min(4, levels["agent_1"] + 1)
+
+
+def test_cli_cp_sweep_smoke(tmp_path: Path) -> None:
+    from src.spec01_net_influence.cli.run_spec01_audit import main
+
+    out = tmp_path / "out"
+    code = main(["--phase", "cpsweep", "--seeds", "2", "--cp-values", "0.5", "1.0", "--cp-rounds", "6", "10",
+                 "--output-dir", str(out)])
+    assert code == 0
+    for name in (
+        "spec01_cp_sweep_runs.csv", "spec01_cp_sweep_cda.csv", "spec01_cp_sweep_swiftness.csv",
+        "fig7_cda_vs_rounds.png", "fig8_net_influence_vs_cp.png", "spec01_report.md",
+    ):
+        assert (out / name).is_file(), name
+    summary = json.loads((out / "spec01_summary.json").read_text(encoding="utf-8"))
+    assert len(summary["cp_sweep"]["swiftness"]) == 3 * 2  # 3 cartel conditions x 2 CP values

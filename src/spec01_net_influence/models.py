@@ -55,8 +55,15 @@ class DiscretizedTrajectory:
 class PairwiseAuditScore:
     """All detector statistics for one unordered agent pair.
 
-    ``directed_info_*`` and ``net_influence`` are surrogate-debiased ("effective")
-    values used for ranking; the ``*_raw`` fields keep the Miller-Madow-only estimates.
+    Influence fields (all surrogate-debiased unless suffixed ``_raw``):
+      * ``directed_info_*``            lag-1 directed information gamma_lag(a;b), gamma_lag(b;a)
+      * ``influence_lag_min``          min of the two directions (the spec's NI, no subtraction)
+      * ``influence_simultaneous``     same-round gamma_sim(a;b) (Bonjour eq. 6, symmetric)
+      * ``net_influence_lag`` /
+        ``net_influence_simultaneous`` Bonjour eq. 4: min over directions of
+                                       gamma(i;j) - max_{k != i,j} gamma(k;j)
+      * ``net_influence``              the score used for ranking (channel set on the ranker)
+      * ``net_influence_raw``          Miller-Madow-only lag min, no subtraction
     ``compression_coupling`` includes message text when the ranker uses messages;
     ``compression_coupling_actions_only`` never does.
     """
@@ -72,6 +79,10 @@ class PairwiseAuditScore:
     directed_info_b_to_a_raw: float = 0.0
     net_influence_raw: float = 0.0
     compression_coupling_actions_only: float = 0.0
+    influence_lag_min: float = 0.0
+    influence_simultaneous: float = 0.0
+    net_influence_lag: float = 0.0
+    net_influence_simultaneous: float = 0.0
 
     @property
     def pair(self) -> frozenset[str]:
@@ -91,6 +102,18 @@ class CoalitionRanking:
             return None
         best = max(self.scores, key=lambda s: s.hybrid_score)
         return (best.agent_a, best.agent_b)
+
+    @property
+    def market_influence(self) -> float:
+        """Market-level collusion score: mean over pairs of the stronger channel, with no
+        third-party subtraction, so an all-agent cartel does not cancel itself out."""
+        if not self.scores:
+            return 0.0
+        return sum(max(s.influence_lag_min, s.influence_simultaneous) for s in self.scores) / len(self.scores)
+
+    def flagged_pairs(self, alpha: float) -> list[tuple[str, str]]:
+        """Bonjour et al. (2022) eq. 5: pairs whose net influence is >= alpha both ways."""
+        return [(s.agent_a, s.agent_b) for s in self.scores if s.net_influence >= alpha]
 
     def rank_of(self, pair: tuple[str, str]) -> int | None:
         """1-based rank of ``pair`` under the hybrid score (None if absent)."""

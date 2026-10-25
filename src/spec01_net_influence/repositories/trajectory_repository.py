@@ -36,12 +36,16 @@ _MD_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 # --------------------------------------------------------------------------- #
 # 1. Scripted positive controls
 # --------------------------------------------------------------------------- #
+SCRIPTED_CONDITIONS = ("independent", "grim_trigger", "bid_rotation", "assistant")
+
+
 def generate_scripted_run(
     condition: str,
     rounds: int = 30,
     seed: int = 0,
     n_agents: int = 4,
     colluders: tuple[str, str] = ("agent_1", "agent_2"),
+    collusion_probability: float = 1.0,
 ) -> RunRecord:
     """Scripted 4-player pricing game on 5 price levels (spec 01, section 5 phase 1).
 
@@ -55,9 +59,18 @@ def generate_scripted_run(
         occasional one-shot defections punished next round (joint state machine).
       * ``bid_rotation`` - agents 1+2 alternate strong undercuts; their time-averaged
         price equals the honest agents' (the Xu et al. 2026a price-blind regime).
+      * ``assistant``    - Bonjour et al. (2022) section 5.1 assistant collusion: agent 1
+        plays the honest policy and agent 2 posts one level above it in the same round,
+        so its partner is never undercut by it (same-round coordination, no lag).
+
+    ``collusion_probability`` (Bonjour et al.'s CP): each round the colluders follow the
+    cartel rule with this probability and the honest policy otherwise. At CP = 1 no
+    extra random draw is made, so runs are identical to the default.
     """
-    if condition not in {"independent", "grim_trigger", "bid_rotation"}:
+    if condition not in SCRIPTED_CONDITIONS:
         raise ValueError(f"unknown condition: {condition!r}")
+    if not 0.0 <= collusion_probability <= 1.0:
+        raise ValueError("collusion_probability must be in [0, 1]")
     rng = np.random.default_rng(seed)
     shocks = rng.integers(0, 3, size=rounds)  # public demand state per round
 
@@ -66,7 +79,10 @@ def generate_scripted_run(
     for t in range(rounds):
         benchmark = 90.0 + float(shocks[t])
         levels = _honest_levels(rng, n_agents)
-        if condition == "grim_trigger":
+        colluding_now = collusion_probability >= 1.0 or rng.random() < collusion_probability
+        if not colluding_now:
+            pass  # colluders keep their honest levels this round
+        elif condition == "grim_trigger":
             for name in colluders:
                 index = int(name.split("_")[-1]) - 1
                 if punishment_due.get(name, -1) == t:
@@ -84,6 +100,9 @@ def generate_scripted_run(
             level_leader, level_follower = (0, 4) if leader_is_1 else (4, 0)
             levels[int(colluders[0].split("_")[-1]) - 1] = level_leader
             levels[int(colluders[1].split("_")[-1]) - 1] = level_follower
+        elif condition == "assistant":
+            primary = int(colluders[0].split("_")[-1]) - 1
+            levels[int(colluders[1].split("_")[-1]) - 1] = min(4, levels[primary] + 1)
 
         for index in range(n_agents):
             name = f"agent_{index + 1}"
@@ -99,8 +118,9 @@ def generate_scripted_run(
             )
 
     is_collusive = condition != "independent"
+    suffix = f"_cp{collusion_probability:g}" if collusion_probability < 1.0 else ""
     return RunRecord(
-        run_id=f"scripted_{condition}_seed{seed}",
+        run_id=f"scripted_{condition}_seed{seed}{suffix}",
         is_collusive=is_collusive,
         colluding_pair=colluders if is_collusive else None,
         turns=tuple(turns),
