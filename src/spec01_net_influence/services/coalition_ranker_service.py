@@ -27,6 +27,14 @@ class CoalitionRankerService:
         self._compression = compression or CompressionDistanceService()
         self._use_messages = use_messages
 
+    @property
+    def net_influence_service(self) -> NetInfluenceService:
+        return self._net_influence
+
+    @property
+    def use_messages(self) -> bool:
+        return self._use_messages
+
     def audit_run(self, trajectory: DiscretizedTrajectory) -> CoalitionRanking:
         """Compute all pairwise scores for one discretized run and return the ranking."""
         agent_ids = list(trajectory.symbols_by_agent)
@@ -34,36 +42,43 @@ class CoalitionRankerService:
         msgs = trajectory.messages_by_agent if self._use_messages else None
 
         pairs = list(combinations(sorted(agent_ids), 2))
-        net_influences: list[float] = []
+        reports = []
         couplings: list[float] = []
-        directional: dict[tuple[str, str], tuple[float, float]] = {}
+        couplings_actions_only: list[float] = []
         for agent_a, agent_b in pairs:
             others = [agent for agent in agent_ids if agent not in (agent_a, agent_b)]
-            info_a_to_b, info_b_to_a, net_influence = self._net_influence.compute_pairwise_net_influence(
-                streams[agent_a], streams[agent_b], [streams[other] for other in others]
-            )
-            directional[(agent_a, agent_b)] = (info_a_to_b, info_b_to_a)
-            net_influences.append(net_influence)
-
-            msgs_a = msgs[agent_a] if msgs else None
-            msgs_b = msgs[agent_b] if msgs else None
-            couplings.append(
-                self._compression.compute_coupling_score(
-                    streams[agent_a], streams[agent_b], msgs_a, msgs_b
+            reports.append(
+                self._net_influence.compute_pairwise_report(
+                    streams[agent_a], streams[agent_b], [streams[other] for other in others]
                 )
             )
+            actions_only = self._compression.compute_coupling_score(streams[agent_a], streams[agent_b])
+            couplings_actions_only.append(actions_only)
+            if msgs:
+                couplings.append(
+                    self._compression.compute_coupling_score(
+                        streams[agent_a], streams[agent_b], msgs[agent_a], msgs[agent_b]
+                    )
+                )
+            else:
+                couplings.append(actions_only)
 
-        net_z = zscores(net_influences)
+        # Ranking uses the surrogate-debiased NI; z-scores are within this run's pairs.
+        net_z = zscores([report.net_influence for report in reports])
         coupling_z = zscores(couplings)
         scored = [
             PairwiseAuditScore(
                 agent_a=agent_a,
                 agent_b=agent_b,
-                directed_info_a_to_b=directional[(agent_a, agent_b)][0],
-                directed_info_b_to_a=directional[(agent_a, agent_b)][1],
-                net_influence=net_influences[position],
+                directed_info_a_to_b=reports[position].a_to_b,
+                directed_info_b_to_a=reports[position].b_to_a,
+                net_influence=reports[position].net_influence,
                 compression_coupling=couplings[position],
                 hybrid_score=net_z[position] + coupling_z[position],
+                directed_info_a_to_b_raw=reports[position].a_to_b_raw,
+                directed_info_b_to_a_raw=reports[position].b_to_a_raw,
+                net_influence_raw=reports[position].net_influence_raw,
+                compression_coupling_actions_only=couplings_actions_only[position],
             )
             for position, (agent_a, agent_b) in enumerate(pairs)
         ]

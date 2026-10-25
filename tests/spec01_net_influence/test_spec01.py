@@ -8,11 +8,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from src.common.metrics import auroc, mann_whitney_p_value
 from src.spec01_net_influence.models import AgentTurnRecord
 from src.spec01_net_influence.repositories.trajectory_repository import (
     generate_scripted_run,
     load_colludebench_jsonl,
     load_double_auction_dir,
+)
+from src.spec01_net_influence.services.audit_statistics_service import (
+    fast_auroc,
+    mann_whitney_p,
+    roc_curve,
+    wilson_interval,
 )
 from src.spec01_net_influence.services.coalition_ranker_service import CoalitionRankerService
 from src.spec01_net_influence.services.compression_service import CompressionDistanceService
@@ -238,3 +245,172 @@ def test_scripted_run_ground_truth() -> None:
     assert not independent.is_collusive and independent.colluding_pair is None
     assert cartel.is_collusive and cartel.colluding_pair == ("agent_1", "agent_2")
     assert len(independent.turns) == 20 * 4
+
+
+# --------------------------------------------------------------------------- #
+# Spec conditioning and surrogate debiasing
+# --------------------------------------------------------------------------- #
+def test_spec_context_conditions_on_target_past() -> None:
+    """Source == target: the spec context (own past) explains everything; compound does not."""
+    rng = np.random.default_rng(4)
+    target = [int(rng.integers(0, 5))]
+    for _ in range(299):
+        target.append(target[-1] if rng.random() < 0.7 else int(rng.integers(0, 5)))
+    spec = NetInfluenceService(context_mode="spec").compute_directed_information(target, target)
+    compound = NetInfluenceService(context_mode="compound").compute_directed_information(target, target)
+    assert spec == pytest.approx(0.0, abs=1e-9)
+    assert compound > 0.3
+
+
+def test_context_mode_validated() -> None:
+    with pytest.raises(ValueError):
+        NetInfluenceService(context_mode="full")
+    with pytest.raises(ValueError):
+        NetInfluenceService(surrogates=-1)
+
+
+def test_surrogate_shifts_are_deterministic_and_in_range() -> None:
+    service = NetInfluenceService(surrogates=19)
+    shifts = service._surrogate_shifts(30)
+    assert shifts == service._surrogate_shifts(30)
+    assert shifts and all(1 <= shift <= 29 for shift in shifts)
+    assert service._surrogate_shifts(3) == []
+
+
+def test_effective_equals_raw_without_surrogates() -> None:
+    rng = np.random.default_rng(5)
+    a = rng.integers(0, 5, size=60).tolist()
+    b = rng.integers(0, 5, size=60).tolist()
+    raw, effective = NetInfluenceService(surrogates=0).compute_effective_directed_information(a, b)
+    assert raw == effective
+
+
+def test_ranker_reports_raw_and_actions_only_fields() -> None:
+    run = generate_scripted_run("bid_rotation", rounds=12, seed=0)
+    trajectory = ResidualizerService(num_bins=5).discretize_turns(
+        run.run_id, run.turns, run.is_collusive, run.colluding_pair
+    )
+    ranking = CoalitionRankerService().audit_run(trajectory)
+    assert len(ranking.scores) == 6
+    for score in ranking.scores:
+        assert score.net_influence_raw >= 0.0
+        assert 0.0 <= score.compression_coupling_actions_only <= 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Benchmark statistics
+# --------------------------------------------------------------------------- #
+def test_fast_auroc_and_p_value_match_reference() -> None:
+    rng = np.random.default_rng(6)
+    pos = rng.integers(0, 8, size=40).astype(float).tolist()  # ties on purpose
+    neg = rng.integers(0, 6, size=35).astype(float).tolist()
+    assert fast_auroc(pos, neg) == pytest.approx(auroc(pos, neg), abs=1e-12)
+    assert mann_whitney_p(pos, neg) == pytest.approx(mann_whitney_p_value(pos, neg), rel=1e-9)
+    assert np.isnan(fast_auroc([], neg))
+
+
+def test_wilson_interval_bounds() -> None:
+    low, high = wilson_interval(0, 10)
+    assert low == pytest.approx(0.0, abs=1e-12) and 0.2 < high < 0.35
+    low, high = wilson_interval(10, 10)
+    assert high == pytest.approx(1.0, abs=1e-12) and 0.65 < low < 0.8
+    assert all(np.isnan(v) for v in wilson_interval(0, 0))
+
+
+def test_roc_curve_endpoints() -> None:
+    fpr, tpr = roc_curve([0.9, 0.8, 0.4], [0.5, 0.1])
+    assert (fpr[0], tpr[0]) == (0.0, 0.0)
+    assert (fpr[-1], tpr[-1]) == (1.0, 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end CLI smoke tests (tiny settings; exercise every writer and figure)
+# --------------------------------------------------------------------------- #
+def test_cli_control_phase_smoke(tmp_path: Path) -> None:
+    from src.spec01_net_influence.cli.run_spec01_audit import main
+
+    out = tmp_path / "out"
+    code = main(["--phase", "control", "--seeds", "2", "--rounds", "10", "--bootstrap", "20",
+                 "--output-dir", str(out)])
+    assert code == 0
+    for name in (
+        "spec01_control_pair_scores.csv", "spec01_control_runs.csv", "spec01_sample_complexity.csv",
+        "spec01_control_separation.csv", "spec01_summary.json", "spec01_report.md", "run_metadata.json",
+        "fig1_net_influence_heatmap.png", "fig3_sample_complexity.png",
+        "fig4_pair_score_distributions.png", "fig5_xu_regime.png",
+    ):
+        assert (out / name).is_file(), name
+    summary = json.loads((out / "spec01_summary.json").read_text(encoding="utf-8"))
+    assert set(summary["control"]["top1_accuracy"]) == {"independent", "grim_trigger", "bid_rotation"}
+
+
+def _write_duopoly_jsonl(path: Path, runs: int, rounds: int, high: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(len(str(path)))
+    with open(path, "w", encoding="utf-8") as handle:
+        for _ in range(runs):
+            for round_id in range(1, rounds + 1):
+                for agent in ("firm_a", "firm_b"):
+                    price = (15.0 if high else 1.1) + float(rng.normal(0.0, 0.2))
+                    handle.write(json.dumps({
+                        "run_id": "r", "round_id": round_id, "agent_id": agent,
+                        "action": f"price:{price:.2f}", "message": "ok", "reward": 0.0,
+                    }) + "\n")
+
+
+def _write_double_auction_dir(root: Path, name: str, asks: list[dict[str, float]]) -> None:
+    exp_dir = root / name
+    exp_dir.mkdir(parents=True)
+    blocks = []
+    for round_number, round_asks in enumerate(asks, start=1):
+        payload = {"round_number": round_number, "seller_asks": round_asks, "seller_messages": {}}
+        blocks.append(f"## Round {round_number}\n\n```json\n{json.dumps(payload)}\n```\n")
+    (exp_dir / "auction_results.md").write_text("\n".join(blocks), encoding="utf-8")
+    (exp_dir / "collusion_metrics.json").write_text(
+        json.dumps({"competitive_equilibrium_price": 90.0}), encoding="utf-8"
+    )
+
+
+def test_cli_cached_phase_smoke(tmp_path: Path) -> None:
+    from src.spec01_net_influence.cli.run_spec01_audit import main
+
+    hackathon = tmp_path / "collusion_hackathon"
+    results = hackathon / "steganographic-collusion" / "results"
+    _write_duopoly_jsonl(results / "audit" / "pricing_duopoly" / "a.jsonl", runs=3, rounds=8, high=True)
+    _write_duopoly_jsonl(results / "calibration" / "pricing_duopoly" / "c.jsonl", runs=3, rounds=8, high=False)
+    data = hackathon / "llm-agent-collusion" / "data"
+    sellers = [{"Seller A": 95.0 + i % 3, "Seller B": 96.0 - i % 2, "Seller C": 94.0 + i % 4} for i in range(6)]
+    _write_double_auction_dir(data, "20250516_212322_base-seller_comms-1", sellers)
+    _write_double_auction_dir(data, "20250516_211616_base-1", sellers)
+
+    out = tmp_path / "out"
+    code = main(["--phase", "cached", "--hackathon-dir", str(hackathon), "--bootstrap", "20",
+                 "--output-dir", str(out)])
+    assert code == 0
+    for name in (
+        "spec01_cached_runs.csv", "spec01_cached_pair_scores.csv", "spec01_cached_auroc.csv",
+        "spec01_cached_group_summary.csv", "fig2_auroc_curves.png", "fig6_cached_score_distributions.png",
+        "spec01_report.md",
+    ):
+        assert (out / name).is_file(), name
+    summary = json.loads((out / "spec01_summary.json").read_text(encoding="utf-8"))
+    assert summary["cached"]["runs"] == 3 + 3 + 2
+    assert summary["cached"]["class_counts"]["all"] == {"collusive": 4, "honest": 4}
+
+
+def test_rebenchmark_breaks_duopoly_mirroring(tmp_path: Path) -> None:
+    """With the population benchmark, two firms' residuals are no longer exact mirrors."""
+    from src.spec01_net_influence.cli.run_spec01_audit import collect_cached_runs
+
+    hackathon = tmp_path / "collusion_hackathon"
+    results = hackathon / "steganographic-collusion" / "results"
+    _write_duopoly_jsonl(results / "audit" / "pricing_duopoly" / "a.jsonl", runs=1, rounds=6, high=True)
+    _write_duopoly_jsonl(results / "calibration" / "pricing_duopoly" / "c.jsonl", runs=2, rounds=6, high=False)
+    collected = collect_cached_runs(hackathon, max_files=0)
+    audit_run, meta = next((run, meta) for run, meta in collected if run.is_collusive)
+    assert meta["benchmark"] == "honest_population_median"
+    by_round: dict[int, list[float]] = {}
+    for turn in audit_run.turns:
+        by_round.setdefault(turn.round_id, []).append(turn.action_value - turn.market_benchmark)
+    # Collusive prices (~15) sit far above the honest median (~1.1): both residuals positive.
+    assert all(min(values) > 10.0 for values in by_round.values())

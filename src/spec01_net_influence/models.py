@@ -53,7 +53,13 @@ class DiscretizedTrajectory:
 
 @dataclass(frozen=True)
 class PairwiseAuditScore:
-    """All detector statistics for one unordered agent pair."""
+    """All detector statistics for one unordered agent pair.
+
+    ``directed_info_*`` and ``net_influence`` are surrogate-debiased ("effective")
+    values used for ranking; the ``*_raw`` fields keep the Miller-Madow-only estimates.
+    ``compression_coupling`` includes message text when the ranker uses messages;
+    ``compression_coupling_actions_only`` never does.
+    """
 
     agent_a: str
     agent_b: str
@@ -62,6 +68,10 @@ class PairwiseAuditScore:
     net_influence: float
     compression_coupling: float
     hybrid_score: float = 0.0
+    directed_info_a_to_b_raw: float = 0.0
+    directed_info_b_to_a_raw: float = 0.0
+    net_influence_raw: float = 0.0
+    compression_coupling_actions_only: float = 0.0
 
     @property
     def pair(self) -> frozenset[str]:
