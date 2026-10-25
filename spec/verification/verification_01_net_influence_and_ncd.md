@@ -71,7 +71,7 @@ Add `outputs/` to `sol-orbital\.gitignore` so run outputs are not committed by a
 |---|---|---|---|
 | 1 | `src/common/metrics.py` | The Miller-Madow correction is now **added**; it used to be subtracted. | The sign was inverted, which doubled the upward bias of every MI / CMI. |
 | 2 | `services/net_influence_service.py` | The context is now **per spec**: the target's own past z_{j,t−1} plus the rounded mean of the other agents' symbols. The old behaviour stays available as `--context-mode compound`. | The old code ignored the target's own past and conditioned on the full tuple of other agents (25+ states for 29 samples at T=30), so NI was mostly noise. |
-| 3 | same | **Surrogate debiasing**: effective DI = raw DI − mean DI over 19 deterministic circular shifts of the source. `--surrogates 0` turns it off. | At T≈30, Miller-Madow cannot equalize bias between low-entropy cartel streams and high-entropy honest streams. Raw and effective values are both saved, so you can show the difference. |
+| 3 | same | **Surrogate debiasing**: effective = raw − mean over 19 surrogate sources. The lag-1 channel uses circular shifts, which keep the source's own dynamics. The same-round channel uses fixed-seed permutations, because shifts leave a periodic schedule unchanged and cancel its coupling. `--surrogates 0` turns debiasing off. | At T≈30, Miller-Madow cannot equalize bias between low-entropy cartel streams and high-entropy honest streams. Raw and effective values are both saved, so you can show the difference. |
 | 4 | `services/coalition_ranker_service.py`, `models.py` | Ranking uses effective NI. Each pair also records raw DI/NI and actions-only CCS. | Lets you separate the action channel from the message channel. |
 | 5 | `cli/run_spec01_audit.py` | `_global_max` crash fixed (the heatmap scale is computed from the matrices). | `--phase control` used to crash at Figure 1. |
 | 6 | same | Harness path: auto-discovery plus `--hackathon-dir`. | It broke when you moved the code into `sol-orbital\`. |
@@ -110,7 +110,9 @@ Where the paper and this implementation differ, say so in the write-up:
 python -m pytest tests/spec01_net_influence -v
 ```
 
-There are 36 tests: the 28 below plus the 8 Bonjour-alignment tests listed after the table.
+There are 37 tests: the 28 below plus the 9 Bonjour-alignment tests listed after the table.
+
+> **First Colab run (25 Oct 2026): 35 / 36 passed.** Both ranker tests previously marked "uncertain" (grim trigger, independent) **passed**. Bid rotation failed (true pair ranked 2nd for seed 1) because circular-shift surrogates cancel a period-2 schedule. The same-round channel now uses permutation surrogates instead, and a regression test was added. Re-run to confirm 37 / 37.
 
 | Test | Expected | What it proves |
 |---|---|---|
@@ -148,6 +150,7 @@ Bonjour-alignment tests (all expected to pass; each one is deterministic or has 
 | Test | What it proves |
 |---|---|
 | `test_simultaneous_influence_detects_same_round_copy` | Same-round channel > 0.5 bits on a same-round copy, while lag-1 stays < 0.1 |
+| `test_simultaneous_influence_survives_periodic_schedule` | Regression for the first Colab failure: a period-2 rotation keeps its coupling after debiasing |
 | `test_bonjour_subtraction_never_exceeds_individual_influence` | Γ ≤ γ with subtraction on; Γ = γ with it off |
 | `test_influence_channel_validated` | A bad `--influence-channel` is rejected |
 | `test_flagged_pairs_market_influence_and_bonjour_rule` | Eq. 5 flagging, the "exactly one pair" rule, and the `market_influence` maths |
@@ -387,7 +390,8 @@ git commit -m "Spec 01: spec-faithful NI conditioning, surrogate debiasing, cach
 
 | Step | Check | Date | Result | Notes |
 |---|---|---|---|---|
-| §3 | `pytest tests/spec01_net_influence -v` | | __ / 36 passed | failures: |
+| §3 | `pytest tests/spec01_net_influence -v` (Colab run 1) | 25 Oct 2026 | 35 / 36 passed | bid_rotation seed 1 ranked 2nd (shift-surrogate bug, fixed) |
+| §3 | `pytest tests/spec01_net_influence -v` (after fix) | | __ / 37 passed | |
 | §3 | ranker grim_trigger test | | pass / fail | |
 | §3 | ranker independent test | | pass / fail | |
 | §4 | (a) corrected < plug-in · (c) MI vs CMI | | | |

@@ -11,6 +11,7 @@ import numpy as np
 from src.common.metrics import conditional_mutual_information
 
 CONTEXT_MODES = ("spec", "compound")
+_PERMUTATION_SEED = 2022  # fixed so same-round surrogates are reproducible across runs
 
 
 @dataclass(frozen=True)
@@ -51,9 +52,10 @@ class NetInfluenceService:
 
     Finite-sample bias: at T ~ 30 the context table is sparse and Miller-Madow cannot
     equalize the bias between low-entropy (cartel) and high-entropy (honest) streams.
-    With ``surrogates > 0`` the "effective" estimate subtracts the mean directed
-    information over deterministic circular shifts of the source stream, which keep its
-    marginal and autocorrelation but break its alignment with the target.
+    With ``surrogates > 0`` the "effective" estimate subtracts the mean over surrogate
+    sources: circular shifts for the lag-1 channel (they keep the source's own dynamics)
+    and fixed-seed permutations for the same-round channel (shifts would leave a periodic
+    schedule unchanged and cancel its coupling).
 
     Net influence is the symmetric minimum NI(i, j) = min(I_1(i->j), I_1(j->i)):
     true collusion requires reciprocal coordination, not one-way price leadership.
@@ -149,15 +151,18 @@ class NetInfluenceService:
             return 0.0, 0.0
         contexts = self._same_round_contexts(length, context_streams)
         raw = conditional_mutual_information(list(stream_a), list(stream_b), contexts, bias_correction=True)
-        shifts = self._surrogate_shifts(length)
-        if not shifts:
+        orders = self._surrogate_permutations(length)
+        if not orders:
             return raw, raw
-        source = list(stream_a)
+        # Permutation (not circular-shift) surrogates: a periodic schedule such as bid
+        # rotation is invariant under circular shifts, so a shift null would reproduce
+        # the full coupling and debias it to zero.
+        source = np.asarray(stream_a)
         null_values = [
             conditional_mutual_information(
-                source[shift:] + source[:shift], list(stream_b), contexts, bias_correction=True
+                source[order].tolist(), list(stream_b), contexts, bias_correction=True
             )
-            for shift in shifts
+            for order in orders
         ]
         return raw, raw - float(np.mean(null_values))
 
@@ -210,6 +215,13 @@ class NetInfluenceService:
             (int(round(float(np.mean([stream[t] for stream in context_streams])))),)
             for t in range(length)
         ]
+
+    def _surrogate_permutations(self, length: int) -> list[np.ndarray]:
+        """Deterministic (fixed-seed) random permutations of 0 .. length-1."""
+        if self._surrogates == 0 or length < 4:
+            return []
+        rng = np.random.default_rng(_PERMUTATION_SEED)
+        return [rng.permutation(length) for _ in range(self._surrogates)]
 
     def _surrogate_shifts(self, length: int) -> list[int]:
         """Deterministic, evenly spaced circular shifts in [1, length - 1]."""

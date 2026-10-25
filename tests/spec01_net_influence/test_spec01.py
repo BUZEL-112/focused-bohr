@@ -436,6 +436,16 @@ def test_simultaneous_influence_detects_same_round_copy() -> None:
     assert lag < 0.1
 
 
+def test_simultaneous_influence_survives_periodic_schedule() -> None:
+    """Regression: a period-2 rotation is invariant under circular shifts, so a shift null
+    debiased its 1 bit of coupling to 0. The permutation null must keep it."""
+    a = [0, 4] * 15
+    b = [4, 0] * 15
+    raw, effective = NetInfluenceService().compute_simultaneous_influence(a, b)
+    assert raw > 0.9
+    assert effective > 0.5
+
+
 def _trajectory(symbols: dict[str, list[int]]) -> DiscretizedTrajectory:
     length = len(next(iter(symbols.values())))
     return DiscretizedTrajectory(
