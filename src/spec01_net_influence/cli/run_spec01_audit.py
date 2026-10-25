@@ -191,6 +191,23 @@ def _truncate(run: RunRecord, rounds: int) -> RunRecord:
     )
 
 
+def align_to_complete_rounds(run: RunRecord) -> tuple[RunRecord, int]:
+    """Keep only rounds in which every agent of the run acted; return (run, rounds dropped).
+
+    Cached logs sometimes miss an agent in a round (e.g. a double-auction seller with no
+    ask that hour). The influence estimators need equal-length, round-aligned streams.
+    """
+    agents = set(run.agent_ids)
+    by_round: dict[int, set[str]] = defaultdict(set)
+    for turn in run.turns:
+        by_round[turn.round_id].add(turn.agent_id)
+    complete = {round_id for round_id, present in by_round.items() if present == agents}
+    dropped = len(by_round) - len(complete)
+    if dropped == 0:
+        return run, 0
+    return replace(run, turns=tuple(turn for turn in run.turns if turn.round_id in complete)), dropped
+
+
 def _r(value: float) -> float:
     return round(float(value), 6)
 
@@ -780,9 +797,15 @@ def run_cached_phase(
     rows: list[dict] = []
     pair_rows: list[dict] = []
 
-    for index, (run, meta) in enumerate(collected, start=1):
-        if len(run.agent_ids) < 2:
+    skipped_runs = 0
+    for index, (original, meta) in enumerate(collected, start=1):
+        if len(original.agent_ids) < 2:
+            skipped_runs += 1
             continue  # single-agent runs carry no pair signal
+        run, rounds_dropped = align_to_complete_rounds(original)
+        if len(run.agent_ids) < 2 or len({turn.round_id for turn in run.turns}) < 2:
+            skipped_runs += 1
+            continue  # fewer than 2 rounds in which every agent acted
         ranking = ranker.audit_run(discretize(run, residualizer))
         ranked = _ranked(ranking)
         top = ranked[0]
@@ -795,6 +818,7 @@ def run_cached_phase(
                 "is_collusive": run.is_collusive,
                 "n_agents": len(run.agent_ids),
                 "n_rounds": len({turn.round_id for turn in run.turns}),
+                "n_rounds_dropped": rounds_dropped,
                 "n_turns": len(run.turns),
                 "n_messages": sum(1 for turn in run.turns if turn.message_text.strip()),
                 "mean_price": _r(np.mean(prices)),
@@ -874,6 +898,8 @@ def run_cached_phase(
 
     return {
         "runs": len(rows),
+        "skipped_runs": skipped_runs,
+        "runs_with_dropped_rounds": sum(1 for row in rows if row["n_rounds_dropped"] > 0),
         "hackathon_dir": str(hackathon_dir),
         "class_counts": {
             scope: {
@@ -1094,6 +1120,10 @@ def build_report(summary: dict, metadata: dict) -> str:
             "",
             f"## Claim 2 — cached logs ({cached['runs']} runs)",
             "",
+            f"Skipped {cached['skipped_runs']} runs (single agent, or fewer than 2 rounds with every agent "
+            f"present); {cached['runs_with_dropped_rounds']} scored runs had incomplete rounds dropped "
+            "(`n_rounds_dropped` in `spec01_cached_runs.csv`).",
+            "",
             "Class counts: "
             + "; ".join(
                 f"{scope}: {counts['collusive']} collusive / {counts['honest']} honest"
@@ -1192,7 +1222,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase in ("cached", "all"):
         print(f"[spec01] cached audit reading {hackathon_dir}")
         summary["cached"] = run_cached_phase(ranker, output_dir, hackathon_dir, args.max_files, args.bootstrap)
-        print(f"[spec01] cached audit: {summary['cached'].get('runs', 0)} runs scored")
+        print(
+            f"[spec01] cached audit: {summary['cached'].get('runs', 0)} runs scored, "
+            f"{summary['cached'].get('skipped_runs', 0)} skipped, "
+            f"{summary['cached'].get('runs_with_dropped_rounds', 0)} with incomplete rounds dropped"
+        )
         for row in summary["cached"].get("auroc", []):
             if row["scope"] == "all":
                 print(f"[spec01]   AUROC {row['screen']}: {_fmt(row['auroc'])}")

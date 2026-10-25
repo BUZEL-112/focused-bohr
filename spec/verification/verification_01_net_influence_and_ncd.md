@@ -310,6 +310,7 @@ python -m src.spec01_net_influence.cli.run_spec01_audit --phase cached --no-mess
 ### 6.3 Sanity checks before you trust any AUROC
 
 1. **Runs are not fragmented.** In `spec01_cached_runs.csv`, `n_rounds` for `colludebench` rows should be well above 1.
+1b. **Incomplete rounds.** Rounds where any agent is missing are dropped before scoring (`n_rounds_dropped`), and runs left with fewer than 2 complete rounds are skipped. The console and report print both counts; quote them in the write-up.
 2. **Benchmark column.** ColludeBench rows should read `honest_population_median` for scenarios that have honest runs (`pricing_duopoly`, `peer_review`, `first_price_auction`, `continuous_double_auction`) and `scenario_population_median` for the `stress/` and `sweeps/` scenarios.
 3. **Class balance.** The report prints collusive/honest counts per scope. ColludeBench is heavily imbalanced (only `calibration/` and `baseline/` are honest), so quote the counts next to every AUROC.
 4. **Labels you should decide on before claiming anything:**
@@ -405,7 +406,8 @@ git commit -m "Spec 01: spec-faithful NI conditioning, surrogate debiasing, cach
 | §5.2 | with vs without Bonjour subtraction | | | |
 | §5.5 | swiftness at CP = 1.0 / 0.4 / 0.2 (B, C, D) | | | |
 | §5.5 | lowest CP reaching 95% CDA by T = 100 | | | |
-| §6.1 | runs scored; class counts | | | |
+| §6.1 | Colab run 1 | 25 Oct 2026 | crashed at ~10,000 / 11,112 runs | an agent missing from some rounds gave unequal streams; fixed by `align_to_complete_rounds` + regression test |
+| §6.1 | runs scored / skipped / with dropped rounds; class counts | | | |
 | §6.1 | `market_influence` AUROC (double auction, all-seller chat) | | | |
 | §6.1 | hybrid AUROC: all / colludebench / double_auction | | | target > 0.88 |
 | §6.1 | price screens AUROC (price_elevation, mean_price, naive) | | | |

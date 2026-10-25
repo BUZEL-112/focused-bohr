@@ -403,6 +403,36 @@ def test_cli_cached_phase_smoke(tmp_path: Path) -> None:
     assert summary["cached"]["class_counts"]["all"] == {"collusive": 4, "honest": 4}
 
 
+def test_cached_phase_survives_agent_missing_from_rounds(tmp_path: Path) -> None:
+    """Regression for the first full Colab run: a seller absent from some rounds produced
+    unequal-length streams and crashed the cached phase."""
+    from src.spec01_net_influence.cli.run_spec01_audit import align_to_complete_rounds, main
+    from src.spec01_net_influence.repositories.trajectory_repository import load_double_auction_dir
+
+    data = tmp_path / "collusion_hackathon" / "llm-agent-collusion" / "data"
+    asks = []
+    for i in range(8):
+        round_asks = {"Seller A": 95.0 + i % 3, "Seller B": 96.0 - i % 2}
+        if i not in (2, 5):  # Seller C posts no ask in two rounds
+            round_asks["Seller C"] = 94.0 + i % 4
+        asks.append(round_asks)
+    _write_double_auction_dir(data, "20250516_212322_base-seller_comms-1", asks)
+    _write_double_auction_dir(data, "20250516_211616_base-1", asks)
+
+    run = load_double_auction_dir(data / "20250516_211616_base-1")
+    aligned, dropped = align_to_complete_rounds(run)
+    assert dropped == 2
+    assert len(aligned.turns) == 6 * 3
+
+    out = tmp_path / "out"
+    code = main(["--phase", "cached", "--hackathon-dir", str(tmp_path / "collusion_hackathon"),
+                 "--bootstrap", "10", "--output-dir", str(out)])
+    assert code == 0
+    summary = json.loads((out / "spec01_summary.json").read_text(encoding="utf-8"))
+    assert summary["cached"]["runs"] == 2
+    assert summary["cached"]["runs_with_dropped_rounds"] == 2
+
+
 def test_rebenchmark_breaks_duopoly_mirroring(tmp_path: Path) -> None:
     """With the population benchmark, two firms' residuals are no longer exact mirrors."""
     from src.spec01_net_influence.cli.run_spec01_audit import collect_cached_runs
